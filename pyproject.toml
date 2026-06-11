@@ -7,7 +7,7 @@ name = "online_pykv"
 version = "0.1.0"
 description = "Python client for kv.osmosis.page"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["qrcode", "tomli_w"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
