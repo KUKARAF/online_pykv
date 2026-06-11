@@ -151,6 +151,7 @@ class KVClient:
     def __init__(
         self,
         session_token: str | None = None,
+        api_key: str | None = None,
         base_url: str | None = None,
         on_auth_error: Optional[Callable[[], str]] = None,
         request_label: str | None = None,
@@ -159,22 +160,24 @@ class KVClient:
         cfg = load_config()
         self._base_url = (base_url or cfg.base_url).rstrip("/")
         self._session_token = session_token or cfg.session_token
+        self._api_key = api_key or cfg.api_key
         self._on_auth_error = on_auth_error
         self._request_label = request_label
         self._request_show_qr = request_show_qr
 
         # Raise only if there's no way to recover at all
-        if not self._session_token and on_auth_error is None:
+        if not self._session_token and not self._api_key and on_auth_error is None:
             raise AuthError(
                 0,
-                "No session token found. Set KV_SESSION_TOKEN or add session_token to "
-                "~/.config/kv/config.toml",
+                "No session token or API key found. Set KV_SESSION_TOKEN / KV_API_KEY "
+                "or add session_token / api_key to ~/.config/kv/config.toml",
             )
 
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._session_token}"}
+        token = self._session_token or self._api_key
+        return {"Authorization": f"Bearer {token}"}
 
     def _renew_session(self) -> None:
         """Acquire a new session token, blocking until approved."""
@@ -212,13 +215,21 @@ class KVClient:
 
     def _request(self, method: str, path: str, body: bytes | None = None) -> str:
         # Ensure we have a token before trying
-        if not self._session_token:
+        if not self._session_token and not self._api_key:
             self._renew_session()
 
         try:
             return self._do_request(method, path, body)
         except AuthError:
-            # Token expired — request a new one and retry once
+            # Token expired — try api_key fallback, then renew
+            if self._api_key and not self._session_token:
+                # We were using session_token; retry with api_key
+                self._session_token = self._api_key
+                try:
+                    return self._do_request(method, path, body)
+                except AuthError:
+                    pass
+            # Either api_key also failed or we were already using it
             self._renew_session()
             return self._do_request(method, path, body)
 
