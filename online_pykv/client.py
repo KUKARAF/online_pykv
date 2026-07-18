@@ -67,7 +67,7 @@ def initiate_session_request(
     the URL, so the terminal output stays clean.
     """
     body = json.dumps({"label": label}).encode()
-    raw = _unauthenticated_request("POST", "/api/session-request/", body, base_url)
+    raw = _unauthenticated_request("POST", "/api/session-request", body, base_url)
     data = json.loads(raw)
 
     print(f"\n  Approval URL:\n  {data['url']}", file=sys.stderr)
