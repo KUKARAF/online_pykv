@@ -1,3 +1,5 @@
+import contextlib
+import errno
 import json
 import sys
 import time
@@ -8,6 +10,12 @@ import urllib.error
 import qrcode
 from typing import Callable, Optional
 from ._config import Config, load_config, _config_path
+
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    _HAS_FCNTL = False
 
 
 class KVError(Exception):
@@ -123,6 +131,65 @@ def await_session_approval(
 
 
 # ---------------------------------------------------------------------------
+# Cross-process session-renewal lock
+# ---------------------------------------------------------------------------
+#
+# Multiple processes (e.g. hermes's main gateway + its dashboard subprocess)
+# can independently discover a missing/expired session token at the same
+# time. Without coordination, each would create its own session-request and
+# send its own approval link/message for what should be a single logical
+# refresh event. This lock serializes _renew_session() across processes so
+# only one ever drives an approval at a time; the rest block until it's
+# done, then adopt the token it obtained instead of requesting their own.
+
+_KV_LOCK_TIMEOUT_SECONDS = 950.0  # slightly over await_session_approval's 900s default
+_KV_LOCK_POLL_SECONDS = 0.2
+
+
+def _kv_lock_path():
+    return _config_path().with_suffix(".lock")
+
+
+@contextlib.contextmanager
+def _kv_session_lock(timeout_seconds: float = _KV_LOCK_TIMEOUT_SECONDS):
+    """Cross-process advisory lock guarding session renewal.
+
+    Held for the *entire* initiate+poll duration (not just the decision),
+    so a sibling process blocks here until the in-flight approval finishes
+    rather than racing in and firing a second, redundant request.
+    """
+    if not _HAS_FCNTL:
+        # Best-effort on non-POSIX platforms — no cross-process guarantee,
+        # but doesn't break single-process usage.
+        yield
+        return
+
+    path = _kv_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(path, "a+")
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while True:
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if e.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for KV session lock ({path})"
+                    ) from e
+                time.sleep(_KV_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            fd.close()
+
+
+# ---------------------------------------------------------------------------
 # KVClient
 # ---------------------------------------------------------------------------
 
@@ -180,21 +247,36 @@ class KVClient:
         return {"Authorization": f"Bearer {token}"}
 
     def _renew_session(self) -> None:
-        """Acquire a new session token, blocking until approved."""
-        if self._on_auth_error is not None:
-            self._session_token = self._on_auth_error()
-        else:
-            # Default: interactive terminal flow
-            result = initiate_session_request(
-                label=self._request_label,
-                base_url=self._base_url,
-                show_qr=self._request_show_qr,
-            )
-            self._session_token = await_session_approval(
-                result["id"],
-                base_url=self._base_url,
-                save_to_config=True,
-            )
+        """Acquire a new session token, blocking until approved.
+
+        Guarded by a cross-process lock (see ``_kv_session_lock``) so that
+        when multiple processes discover a missing/expired token at once,
+        only one of them actually drives an approval — the rest block here
+        and then adopt the token it wrote instead of requesting their own.
+        """
+        with _kv_session_lock():
+            # Another process may have already refreshed the token while we
+            # were waiting for the lock — adopt it instead of requesting a
+            # second, redundant session.
+            cfg = load_config()
+            if cfg.session_token and cfg.session_token != self._session_token:
+                self._session_token = cfg.session_token
+                return
+
+            if self._on_auth_error is not None:
+                self._session_token = self._on_auth_error()
+            else:
+                # Default: interactive terminal flow
+                result = initiate_session_request(
+                    label=self._request_label,
+                    base_url=self._base_url,
+                    show_qr=self._request_show_qr,
+                )
+                self._session_token = await_session_approval(
+                    result["id"],
+                    base_url=self._base_url,
+                    save_to_config=True,
+                )
 
     def _do_request(self, method: str, path: str, body: bytes | None = None) -> str:
         url = f"{self._base_url}{path}"
