@@ -7,6 +7,7 @@ import tomllib
 import tomli_w
 import urllib.request
 import urllib.error
+import urllib.parse
 import qrcode
 from typing import Callable, Optional
 from ._config import Config, load_config, _config_path
@@ -96,21 +97,28 @@ def await_session_approval(
     poll_interval: float = 5.0,
     timeout: float = 900.0,
     save_to_config: bool = True,
+    poll_secret: str | None = None,
 ) -> str:
     """Poll for approval of a session request (no auth required).
 
     Blocks until the request is approved, rejected, or timed out.
     Returns the session token string on success.
     Raises ``KVError`` on rejection, expiry, or timeout.
+
+    ``poll_secret`` is the ``poll_secret`` field from the matching
+    ``initiate_session_request`` response.  The server requires it on the
+    status endpoint (it proves we created the request); without it every
+    poll 400s and the loop would spin until timeout even after approval.
     """
     print("  Polling for approval…", file=sys.stderr)
+    status_path = f"/api/session-request/{request_id}/status"
+    if poll_secret:
+        status_path += f"?secret={urllib.parse.quote(poll_secret, safe='')}"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(poll_interval)
         try:
-            raw = _unauthenticated_request(
-                "GET", f"/api/session-request/{request_id}/status", base_url=base_url
-            )
+            raw = _unauthenticated_request("GET", status_path, base_url=base_url)
         except KVError:
             continue
         status_data = json.loads(raw)
@@ -276,6 +284,7 @@ class KVClient:
                     result["id"],
                     base_url=self._base_url,
                     save_to_config=True,
+                    poll_secret=result.get("poll_secret"),
                 )
 
     def _do_request(self, method: str, path: str, body: bytes | None = None) -> str:
@@ -340,6 +349,7 @@ class KVClient:
         poll_interval: float = 5.0,
         timeout: float = 900.0,
         save_to_config: bool = True,
+        poll_secret: str | None = None,
     ) -> str:
         """Thin wrapper around the module-level ``await_session_approval``."""
         return await_session_approval(
@@ -348,6 +358,7 @@ class KVClient:
             poll_interval=poll_interval,
             timeout=timeout,
             save_to_config=save_to_config,
+            poll_secret=poll_secret,
         )
 
     def request_session(
@@ -365,6 +376,7 @@ class KVClient:
             poll_interval=poll_interval,
             timeout=timeout,
             save_to_config=save_to_config,
+            poll_secret=result.get("poll_secret"),
         )
 
 
