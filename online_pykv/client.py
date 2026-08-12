@@ -73,9 +73,11 @@ def initiate_session_request(
 ) -> dict:
     """Create a KV session request (no auth required).
 
-    Returns a dict with ``id``, ``url``, ``expires_at``, ``poll_secret`` and
-    ``confirm_code``.  Prints the approval URL to stderr; optionally renders an
-    ASCII QR code.
+    Returns a dict with ``id``, ``url``, ``expires_at`` and ``poll_secret``.
+    (The server no longer returns a ``confirm_code`` or ``session_token`` here;
+    approval is driven by a device-encrypted one-time token delivered on the
+    status endpoint — see :func:`await_session_approval`.)  Prints the approval
+    URL to stderr; optionally renders an ASCII QR code.
 
     Pass ``show_qr=False`` when a separate channel (e.g. Zulip) will carry
     the URL, so the terminal output stays clean.
@@ -142,6 +144,11 @@ def await_session_approval(
     with ``device_private_key`` (base64 PKCS#8 DER; falls back to config /
     ``KV_DEVICE_PRIVATE_KEY``).  The envelope is one-time-read on the server,
     so the very first ``approved`` poll must succeed at decrypting it.
+
+    While the request is still pending, the status endpoint also returns an
+    idempotent ``approval_envelope`` (same device-KV shape as ``envelope``).
+    It is decrypted here to an *approval token* which we print once for the
+    operator to relay to their admin; the admin uses it to approve the request.
     """
     if device_private_key is None:
         device_private_key = load_config().device_private_key
@@ -157,6 +164,7 @@ def await_session_approval(
     if poll_secret:
         status_path += f"?secret={urllib.parse.quote(poll_secret, safe='')}"
     deadline = time.monotonic() + timeout
+    approval_token_shown = False
     while time.monotonic() < deadline:
         time.sleep(poll_interval)
         try:
@@ -165,6 +173,26 @@ def await_session_approval(
             continue
         status_data = json.loads(raw)
         status = status_data.get("status", "")
+        # While pending, the server hands back a device-encrypted, one-time
+        # approval token (idempotent / re-fetchable). Decrypt and print it once
+        # so the operator can relay it to their admin to drive the approval.
+        if not approval_token_shown:
+            approval_envelope = status_data.get("approval_envelope")
+            if approval_envelope:
+                try:
+                    approval_token = _crypto.decrypt_envelope(
+                        approval_envelope, device_private_key
+                    )
+                except (KeyError, ValueError, InvalidTag) as e:
+                    raise KVError(
+                        0, f"failed to decrypt approval token: {e}"
+                    ) from e
+                print(
+                    f"\n  Approval code: {approval_token}  "
+                    "— relay this to your admin to approve\n",
+                    file=sys.stderr,
+                )
+                approval_token_shown = True
         if status == "approved":
             envelope = status_data.get("envelope")
             if not envelope:
