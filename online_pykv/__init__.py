@@ -5,6 +5,7 @@ from .client import (
     AuthError,
     initiate_session_request,
     await_session_approval,
+    provision_device,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "AuthError",
     "initiate_session_request",
     "await_session_approval",
+    "provision_device",
 ]
