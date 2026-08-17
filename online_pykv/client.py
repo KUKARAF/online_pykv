@@ -1,6 +1,7 @@
 import contextlib
 import errno
 import json
+import socket
 import sys
 import time
 import tomllib
@@ -69,38 +70,68 @@ def initiate_session_request(
     base_url: str | None = None,
     show_qr: bool = True,
     device_id: str | None = None,
+    device_private_key: str | None = None,
     requested_duration_hours: int | None = None,
 ) -> dict:
     """Create a KV session request (no auth required).
 
-    Returns a dict with ``id``, ``url``, ``expires_at`` and ``poll_secret``.
-    (The server no longer returns a ``confirm_code`` or ``session_token`` here;
-    approval is driven by a device-encrypted one-time token delivered on the
-    status endpoint — see :func:`await_session_approval`.)  Prints the approval
-    URL to stderr; optionally renders an ASCII QR code.
+    The server now requires proof of device-key possession before it will even
+    create a pending request, closing a hole where anyone who merely knew a
+    ``device_id`` (leaked log, screenshot, whatever) could spam legitimate-looking
+    approval requests. This is a two-call flow:
+
+    1. ``POST /api/session-request/challenge {device_id}`` — the server mints a
+       random nonce and returns it ECDH-wrapped to the device's public key.
+    2. Decrypt that envelope locally with the device private key (same routine
+       used for the final approved-token envelope), then
+       ``POST /api/session-request {challenge_id, nonce, label,
+       requested_duration_hours}``. A bare ``device_id`` is no longer accepted
+       by this endpoint.
+
+    Returns a dict with ``id``, ``url``, ``expires_at`` and ``poll_secret``
+    (unchanged). Prints the approval URL to stderr; optionally renders an
+    ASCII QR code.
 
     Pass ``show_qr=False`` when a separate channel (e.g. Zulip) will carry
     the URL, so the terminal output stays clean.
 
-    ``device_id`` is now REQUIRED by the server: the approved session token is
-    ECDH-wrapped to that registered device's public key.  Falls back to the
-    ``device_id`` in config / ``KV_DEVICE_ID``.  If none is configured, run
-    :func:`provision_device` once and enrol the printed public key (see its
-    docstring) to obtain a device id.
+    ``device_id`` / ``device_private_key`` fall back to config
+    (``KV_DEVICE_ID`` / ``KV_DEVICE_PRIVATE_KEY``). If neither is configured,
+    run :func:`provision_device` once to enrol a device automatically.
     """
+    cfg = load_config()
     if device_id is None:
-        device_id = load_config().device_id
-    if not device_id:
+        device_id = cfg.device_id
+    if device_private_key is None:
+        device_private_key = cfg.device_private_key
+    if not device_id or not device_private_key:
         raise KVError(
             0,
-            "No device_id configured. The server now wraps the approved "
-            "session token to a registered device key. Run "
-            "online_pykv.provision_device() once, enrol the printed public key "
-            "in the web admin panel, then put the returned device_id in "
-            "~/.config/kv/config.toml (or set KV_DEVICE_ID).",
+            "No device_id/device_private_key configured. The server requires "
+            "proof of device-key possession before creating a session request. "
+            "Run online_pykv.provision_device() once to enrol a device "
+            "automatically.",
         )
 
-    payload: dict = {"label": label, "device_id": device_id}
+    challenge_body = json.dumps({"device_id": device_id}).encode()
+    challenge_raw = _unauthenticated_request(
+        "POST", "/api/session-request/challenge", challenge_body, base_url
+    )
+    challenge_data = json.loads(challenge_raw)
+    try:
+        nonce = _crypto.decrypt_envelope(
+            challenge_data["envelope"], device_private_key
+        )
+    except (KeyError, ValueError, InvalidTag) as e:
+        raise KVError(
+            0, f"failed to decrypt session-request challenge: {e}"
+        ) from e
+
+    payload: dict = {
+        "label": label,
+        "challenge_id": challenge_data["challenge_id"],
+        "nonce": nonce,
+    }
     if requested_duration_hours is not None:
         payload["requested_duration_hours"] = requested_duration_hours
     body = json.dumps(payload).encode()
@@ -145,10 +176,10 @@ def await_session_approval(
     ``KV_DEVICE_PRIVATE_KEY``).  The envelope is one-time-read on the server,
     so the very first ``approved`` poll must succeed at decrypting it.
 
-    While the request is still pending, the status endpoint also returns an
-    idempotent ``approval_envelope`` (same device-KV shape as ``envelope``).
-    It is decrypted here to an *approval token* which we print once for the
-    operator to relay to their admin; the admin uses it to approve the request.
+    Approval itself now happens without any code/token relayed through the
+    operator: an admin reviews the pending request in the web admin panel
+    (using the device's real, immutable registered name) and approves it
+    there directly.
     """
     if device_private_key is None:
         device_private_key = load_config().device_private_key
@@ -164,7 +195,6 @@ def await_session_approval(
     if poll_secret:
         status_path += f"?secret={urllib.parse.quote(poll_secret, safe='')}"
     deadline = time.monotonic() + timeout
-    approval_token_shown = False
     while time.monotonic() < deadline:
         time.sleep(poll_interval)
         try:
@@ -173,26 +203,6 @@ def await_session_approval(
             continue
         status_data = json.loads(raw)
         status = status_data.get("status", "")
-        # While pending, the server hands back a device-encrypted, one-time
-        # approval token (idempotent / re-fetchable). Decrypt and print it once
-        # so the operator can relay it to their admin to drive the approval.
-        if not approval_token_shown:
-            approval_envelope = status_data.get("approval_envelope")
-            if approval_envelope:
-                try:
-                    approval_token = _crypto.decrypt_envelope(
-                        approval_envelope, device_private_key
-                    )
-                except (KeyError, ValueError, InvalidTag) as e:
-                    raise KVError(
-                        0, f"failed to decrypt approval token: {e}"
-                    ) from e
-                print(
-                    f"\n  Approval code: {approval_token}  "
-                    "— relay this to your admin to approve\n",
-                    file=sys.stderr,
-                )
-                approval_token_shown = True
         if status == "approved":
             envelope = status_data.get("envelope")
             if not envelope:
@@ -368,6 +378,7 @@ class KVClient:
                     base_url=self._base_url,
                     show_qr=self._request_show_qr,
                     device_id=self._device_id,
+                    device_private_key=self._device_private_key,
                 )
                 self._session_token = await_session_approval(
                     result["id"],
@@ -419,6 +430,10 @@ class KVClient:
     def get(self, key: str) -> str:
         return self._request("GET", f"/kv/{key}")
 
+    def whoami(self) -> dict:
+        """Look up which device (if any) this client's credential is bound to."""
+        return json.loads(self._request("GET", "/api/admin/session/whoami"))
+
     def get_or_default(self, key: str, default: str = "") -> str:
         try:
             return self.get(key)
@@ -430,6 +445,7 @@ class KVClient:
         label: str | None = None,
         show_qr: bool = True,
         device_id: str | None = None,
+        device_private_key: str | None = None,
     ) -> dict:
         """Thin wrapper around the module-level ``initiate_session_request``."""
         return initiate_session_request(
@@ -437,6 +453,7 @@ class KVClient:
             base_url=self._base_url,
             show_qr=show_qr,
             device_id=device_id or self._device_id,
+            device_private_key=device_private_key or self._device_private_key,
         )
 
     def await_session_approval(
@@ -504,50 +521,136 @@ def _save_session_token(token: str) -> None:
 #
 # Device registration on the server is WebAuthn-gated
 # (POST /api/devices/register/begin|finish), which a headless Python client
-# cannot perform — there is no passkey / authenticator here. So provisioning
-# is split: this client generates the keypair and keeps the PRIVATE key
-# locally; a human enrols the corresponding PUBLIC key through a
-# WebAuthn-capable surface (the web admin panel) and reads back the assigned
-# device_id, which then goes into config. We deliberately do NOT fabricate a
-# WebAuthn assertion.
+# cannot perform — there is no passkey / authenticator here. Enrolment is a
+# "propose, then admin confirms" flow mirroring session-request approval:
+# this client generates the keypair, keeps the PRIVATE key locally, and
+# proposes the PUBLIC key to the server (POST /api/devices/propose). An admin
+# reviews the proposal in the web admin panel and confirms it with a real
+# WebAuthn passkey touch — that remains the actual security gate. This client
+# just polls until that confirmation lands and saves the resulting
+# ``device_id`` automatically, with no manual copy-paste required.
 
 def provision_device(
+    name: str | None = None,
     key_type: str = "x25519",
+    base_url: str | None = None,
+    poll_interval: float = 5.0,
+    timeout: float = 1800.0,
     save_to_config: bool = True,
     print_instructions: bool = True,
 ) -> dict:
-    """Generate + store a device keypair and print enrolment instructions.
+    """Generate a device keypair, propose it to the server, and wait for admin confirmation.
 
-    Generates an ``x25519`` (default) or ``p256`` device keypair, saves the
-    PRIVATE key to ``~/.config/kv/config.toml`` (``device_private_key``), and
-    prints the PUBLIC key plus the manual steps to enrol it.
+    Generates an ``x25519`` (default) or ``p256`` device keypair, then:
 
-    Returns ``{key_type, public_key, private_key}`` (both keys base64).  The
-    ``device_id`` is NOT set here — it is assigned by the server when a human
-    enrols the public key via the WebAuthn-capable web admin panel; copy that
-    id back into config (``device_id``) or set ``KV_DEVICE_ID``.
+    1. ``POST /api/devices/propose {name, public_key, key_type}`` — the
+       PRIVATE key never leaves this client.
+    2. Prints the returned review ``url`` prominently — open it and confirm
+       via a real WebAuthn passkey touch (the actual security gate; this
+       client cannot fake it).
+    3. Polls ``GET /api/devices/propose/{id}/status`` (default every 5s) until
+       ``confirmed``, then saves ``device_id`` + ``device_private_key`` to
+       ``~/.config/kv/config.toml`` — no manual copy-paste needed.
+
+    ``timeout`` defaults to 1800s (30 minutes), matching the server-side
+    proposal expiry. Raises ``KVError`` if the proposal is rejected, expires,
+    or the timeout is reached.
+
+    ``name`` defaults to the local hostname if omitted. Returns
+    ``{device_id, key_type, public_key, private_key}`` (keys base64).
     """
+    if name is None:
+        name = socket.gethostname()
+
     private_key, public_key = _crypto.generate_device_keypair(key_type)
-    if save_to_config:
-        _save_config_values(device_private_key=private_key)
+
+    payload = {"name": name, "public_key": public_key, "key_type": key_type}
+    body = json.dumps(payload).encode()
+    raw = _unauthenticated_request("POST", "/api/devices/propose", body, base_url)
+    data = json.loads(raw)
 
     if print_instructions:
         print(
-            "\n  Device keypair generated"
-            + (" and private key saved to config." if save_to_config else ".")
-            + f"\n\n  key_type:   {key_type}"
-            + f"\n  public key: {public_key}\n"
-            "\n  NEXT (manual, one-time): the server enrols devices via "
-            "WebAuthn,\n  which this headless client cannot do. Open the web "
-            "admin panel on\n  a passkey-capable device, register a new device "
-            "with the public key\n  above, then copy the assigned device_id "
-            "into ~/.config/kv/config.toml\n  (device_id = \"...\") or set "
-            "KV_DEVICE_ID.\n",
+            f"\n  Device keypair generated (key_type: {key_type}).\n"
+            f"\n  Open this link and confirm: {data['url']}"
+            f"\n  Expires: {data['expires_at']}\n",
             file=sys.stderr,
         )
 
-    return {
-        "key_type": key_type,
-        "public_key": public_key,
-        "private_key": private_key,
-    }
+    status_path = (
+        f"/api/devices/propose/{data['id']}/status"
+        f"?secret={urllib.parse.quote(data['poll_secret'], safe='')}"
+    )
+    deadline = time.monotonic() + timeout
+    if print_instructions:
+        print("  Waiting for admin confirmation…", file=sys.stderr)
+    while time.monotonic() < deadline:
+        time.sleep(poll_interval)
+        try:
+            status_raw = _unauthenticated_request(
+                "GET", status_path, base_url=base_url
+            )
+        except KVError:
+            continue
+        status_data = json.loads(status_raw)
+        status = status_data.get("status", "")
+        if status == "confirmed":
+            device_id = status_data["device_id"]
+            if save_to_config:
+                _save_config_values(
+                    device_id=device_id, device_private_key=private_key
+                )
+            if print_instructions:
+                print(f"\n  ✅  Device enrolled: {device_id}", file=sys.stderr)
+            return {
+                "device_id": device_id,
+                "key_type": key_type,
+                "public_key": public_key,
+                "private_key": private_key,
+            }
+        if status in ("rejected", "expired"):
+            raise KVError(0, f"Device proposal {status}")
+        if print_instructions:
+            print(".", end="", flush=True, file=sys.stderr)
+
+    raise KVError(0, "Timed out waiting for device proposal confirmation")
+
+
+# ---------------------------------------------------------------------------
+# Self-identify
+# ---------------------------------------------------------------------------
+
+def whoami(
+    session_token: str | None = None,
+    base_url: str | None = None,
+) -> dict:
+    """Look up which device (if any) the current session token is bound to.
+
+    Calls ``GET /api/admin/session/whoami`` with the session token as a
+    Bearer credential (falls back to config / ``KV_SESSION_TOKEN``, then
+    ``KV_API_KEY``). Returns ``{"device_id": ..., "device_name": ...}``, both
+    ``None`` if the credential isn't device-bound.
+    """
+    if session_token is None:
+        cfg = load_config()
+        session_token = cfg.session_token or cfg.api_key
+    if not session_token:
+        raise AuthError(
+            0,
+            "No session token or API key available. Set KV_SESSION_TOKEN / "
+            "KV_API_KEY or add session_token / api_key to "
+            "~/.config/kv/config.toml",
+        )
+
+    url = f"{_resolve_base_url(base_url)}/api/admin/session/whoami"
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {session_token}"}, method="GET"
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode()
+        if e.code == 401:
+            raise AuthError(e.code, msg) from e
+        raise KVError(e.code, msg) from e

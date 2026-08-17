@@ -6,6 +6,7 @@ from .client import (
     initiate_session_request,
     await_session_approval,
     provision_device,
+    whoami,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "initiate_session_request",
     "await_session_approval",
     "provision_device",
+    "whoami",
 ]
